@@ -23,7 +23,7 @@ use std::cell::Cell;
 use std::time::Duration;
 
 use iced::widget::{column, text};
-use iced::{Element, Length, Task, Theme};
+use iced::{Length, Task, Theme, Widget};
 use iced_autocomplete::{Filter, State, auto_complete};
 
 /// Quiet period before a pending request is allowed to contact the "server".
@@ -147,7 +147,7 @@ impl Demo {
         }
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self) -> impl Widget<Message> {
         column![
             text("Remote autocomplete demo").size(24),
             text(&self.status).size(14),
@@ -174,7 +174,6 @@ impl Demo {
         ]
         .spacing(16)
         .padding(24)
-        .into()
     }
 
     fn theme(&self) -> Theme {

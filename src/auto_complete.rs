@@ -8,19 +8,20 @@
 //! [`iced_widget::text_input::TextInput`] and [`iced_widget::overlay::menu::Menu`]
 //! and does not patch iced itself.
 
-use iced_core::clipboard::Clipboard;
 use iced_core::event::Event;
 use iced_core::keyboard;
 use iced_core::keyboard::key;
 use iced_core::layout::{self, Layout};
 use iced_core::mouse;
-use iced_core::overlay::Element as OverlayElement;
 use iced_core::renderer;
 use iced_core::text;
+use iced_core::text::{editor, input};
+use iced_core::widget::operation::Focusable as _;
 use iced_core::widget::{self, Widget};
-use iced_core::{Element, Length, Padding, Pixels, Rectangle, Shell, Size, Theme, Vector};
+use iced_core::window;
+use iced_core::{Element, Font, Length, Padding, Pixels, Rectangle, Shell, Size, Theme, Vector};
 use iced_widget::overlay::menu;
-use iced_widget::text_input::{self, TextInput};
+use iced_widget::text_input;
 
 use std::cell::RefCell;
 use std::fmt::{Debug, Display, Formatter};
@@ -53,17 +54,16 @@ where
     T: Display + Clone + 'static,
     Message: Clone + 'a,
     Theme: Catalog + 'a,
-    Renderer: text::Renderer + 'a,
+    Renderer: text::Renderer + 'static,
 {
     AutoComplete {
         state,
-        text_input: TextInput::new(placeholder, &state.value())
-            .on_input(TextInputEvent::TextChanged)
-            .class(Theme::default_input())
-            .padding(text_input::DEFAULT_PADDING),
+        placeholder,
         font: None,
         padding: text_input::DEFAULT_PADDING,
         size: None,
+        line_height: None,
+        width: Length::Fill,
         on_input: Box::new(on_input),
         on_submit: Box::new(on_submit),
         on_option_selected: on_option_selected
@@ -72,8 +72,11 @@ where
         on_open: None,
         on_close: None,
         text_shaping: text::Shaping::default(),
+        input_class: Theme::default_input(),
         menu_class: <Theme as Catalog>::default_menu(),
         menu_height: Length::Shrink,
+        last_status: None,
+        _renderer: std::marker::PhantomData,
     }
 }
 
@@ -84,10 +87,12 @@ where
     Renderer: text::Renderer,
 {
     state: &'a State<T>,
-    text_input: TextInput<'a, TextInputEvent, Theme, Renderer>,
-    font: Option<Renderer::Font>,
+    placeholder: &'a str,
+    font: Option<Font>,
     padding: Padding,
     size: Option<f32>,
+    line_height: Option<text::LineHeight>,
+    width: Length,
     on_input: Box<dyn Fn(String) -> Message + 'a>,
     on_submit: Box<dyn Fn(String) -> Message + 'a>,
     on_option_selected: Option<Box<dyn Fn(T) -> Message + 'a>>,
@@ -95,8 +100,11 @@ where
     on_open: Option<Message>,
     on_close: Option<Message>,
     text_shaping: text::Shaping,
+    input_class: <Theme as text_input::Catalog>::Class<'a>,
     menu_class: <Theme as menu::Catalog>::Class<'a>,
     menu_height: Length,
+    last_status: Option<text_input::Status>,
+    _renderer: std::marker::PhantomData<Renderer>,
 }
 
 impl<'a, T, Message, Theme, Renderer> AutoComplete<'a, T, Message, Theme, Renderer>
@@ -104,7 +112,7 @@ where
     T: Display + Clone + 'static,
     Message: Clone + 'a,
     Theme: Catalog + 'a,
-    Renderer: text::Renderer + 'a,
+    Renderer: text::Renderer + 'static,
 {
     /// Sets the text currently displayed/edited by the input (usually pass
     /// `state.value()` so it persists across views).
@@ -162,22 +170,13 @@ where
     #[must_use]
     pub fn padding(mut self, padding: impl Into<Padding>) -> Self {
         self.padding = padding.into();
-        self.text_input = self.text_input.padding(self.padding);
         self
     }
 
     /// Sets the font.
     #[must_use]
-    pub fn font(mut self, font: Renderer::Font) -> Self {
-        self.font = Some(font);
-        self.text_input = self.text_input.font(font);
-        self
-    }
-
-    /// Sets the [`text_input::Icon`] of the input.
-    #[must_use]
-    pub fn icon(mut self, icon: text_input::Icon<Renderer::Font>) -> Self {
-        self.text_input = self.text_input.icon(icon);
+    pub fn font(mut self, font: impl Into<Font>) -> Self {
+        self.font = Some(font.into());
         self
     }
 
@@ -186,21 +185,20 @@ where
     pub fn size(mut self, size: impl Into<Pixels>) -> Self {
         let size = size.into();
         self.size = Some(size.0);
-        self.text_input = self.text_input.size(size);
         self
     }
 
     /// Sets the line height.
     #[must_use]
     pub fn line_height(mut self, line_height: impl Into<text::LineHeight>) -> Self {
-        self.text_input = self.text_input.line_height(line_height);
+        self.line_height = Some(line_height.into());
         self
     }
 
     /// Sets the width.
     #[must_use]
     pub fn width(mut self, width: impl Into<Length>) -> Self {
-        self.text_input = self.text_input.width(width);
+        self.width = width.into();
         self
     }
 
@@ -220,7 +218,7 @@ where
     where
         <Theme as text_input::Catalog>::Class<'a>: From<text_input::StyleFn<'a, Theme>>,
     {
-        self.text_input = self.text_input.style(style);
+        self.input_class = (Box::new(style) as text_input::StyleFn<'a, Theme>).into();
         self
     }
 
@@ -514,7 +512,8 @@ where
 }
 
 /// Private overlay state of the widget.
-struct Menu<T> {
+struct Menu<T, R: text::Renderer> {
+    input: text::Input<R>,
     menu: menu::State,
     hovered_option: Option<usize>,
     new_selection: Option<T>,
@@ -530,9 +529,11 @@ struct Menu<T> {
     closed_by_click: bool,
 }
 
-#[derive(Debug, Clone)]
-enum TextInputEvent {
-    TextChanged(String),
+impl<T, Message, Theme, Renderer> widget::Meta for AutoComplete<'_, T, Message, Theme, Renderer>
+where
+    Theme: Catalog,
+    Renderer: text::Renderer,
+{
 }
 
 impl<T, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -541,34 +542,55 @@ where
     T: Display + Clone + 'static,
     Message: Clone,
     Theme: Catalog,
-    Renderer: text::Renderer,
+    Renderer: text::Renderer + 'static,
 {
     fn size(&self) -> Size<Length> {
-        Widget::<TextInputEvent, Theme, Renderer>::size(&self.text_input)
+        Size {
+            width: self.width,
+            height: Length::Fit,
+        }
     }
 
-    fn layout(
-        &mut self,
-        tree: &mut widget::Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        self.text_input.layout(
-            &mut tree.children[0],
+    fn layout(&mut self, tree: &mut widget::Tree, renderer: &Renderer, limits: &layout::Limits) {
+        let menu = tree.state.downcast_mut::<Menu<T, Renderer>>();
+
+        // Keep the editor in sync with the external value, mirroring what
+        // `TextInput` did when it owned this comparison. While typing, both
+        // sides already match (update writes them together), so this only
+        // fires for external writes (`value()`, `set_value`, overlay picks).
+        let current = self.state.value();
+        if menu.input.value() != current {
+            menu.input.overwrite(&current);
+        }
+
+        tree.size = menu.input.layout(
             renderer,
             limits,
-            // The autocomplete always displays the text value; unlike
-            // combo_box, no hidden selection overlay is needed.
-            None,
-        )
+            input::Layout {
+                width: self.width,
+                height: Length::Fit,
+                padding: self.padding,
+                placeholder: self.placeholder,
+                font: self.font,
+                size: self.size.map(Pixels),
+                line_height: self.line_height,
+                alignment: text::Alignment::Default,
+                multiline: None,
+                is_secure: false,
+            },
+        );
     }
 
     fn tag(&self) -> widget::tree::Tag {
-        widget::tree::Tag::of::<Menu<T>>()
+        widget::tree::Tag::of::<Menu<T, Renderer>>()
     }
 
     fn state(&self) -> widget::tree::State {
-        widget::tree::State::new(Menu::<T> {
+        let mut input = text::Input::<Renderer>::new();
+        input.overwrite(&self.state.value());
+
+        widget::tree::State::new(Menu::<T, Renderer> {
+            input,
             menu: menu::State::new(),
             filtered_options: Filtered::empty(),
             hovered_option: Some(0),
@@ -578,58 +600,32 @@ where
         })
     }
 
-    fn children(&self) -> Vec<widget::Tree> {
-        vec![widget::Tree::new(&self.text_input as &dyn Widget<_, _, _>)]
-    }
-
-    fn diff(&self, _tree: &mut widget::Tree) {
-        // Keep the child tree intact so its state is not dropped.
-    }
-
     fn update(
         &mut self,
         tree: &mut widget::Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
-        renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
+        _renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
-        viewport: &Rectangle,
+        _viewport: &Rectangle,
     ) {
-        let menu = tree.state.downcast_mut::<Menu<T>>();
+        let menu = tree.state.downcast_mut::<Menu<T, Renderer>>();
 
-        let started_focused = {
-            let text_input_state = tree.children[0]
-                .state
-                .downcast_ref::<text_input::State<Renderer::Paragraph>>();
-            text_input_state.is_focused()
-        };
+        let started_focused = menu.input.is_focused();
 
-        // Let the text input handle input events first.
-        let mut local_messages = Vec::new();
-        let mut local_shell = Shell::new(&mut local_messages);
-
-        self.text_input.update(
-            &mut tree.children[0],
+        // Let the editor handle input events first (typing, cursor, focus).
+        let edit = menu.input.update(
             event,
-            layout,
+            layout.bounds(),
             cursor,
-            renderer,
-            clipboard,
-            &mut local_shell,
-            viewport,
+            shell,
+            editor::Binding::from_key_press,
         );
 
-        if local_shell.is_event_captured() {
-            shell.capture_event();
-        }
-        shell.request_redraw_at(local_shell.redraw_request());
-        shell.request_input_method(local_shell.input_method());
-
-        // React to the text input's local messages (text changed).
-        for message in local_messages {
-            let TextInputEvent::TextChanged(new_value) = message;
+        // React to text changes.
+        if edit.is_some() {
+            let new_value = menu.input.value();
 
             shell.publish((self.on_input)(new_value.clone()));
 
@@ -644,12 +640,7 @@ where
             shell.request_redraw();
         }
 
-        let is_focused = {
-            let text_input_state = tree.children[0]
-                .state
-                .downcast_ref::<text_input::State<Renderer::Paragraph>>();
-            text_input_state.is_focused()
-        };
+        let is_focused = menu.input.is_focused();
 
         // Set when `Escape` closes the menu. Collected rather than published
         // inline so every close is reported from one place, exactly once.
@@ -758,12 +749,7 @@ where
             shell.request_redraw();
         }
 
-        let is_focused = {
-            let text_input_state = tree.children[0]
-                .state
-                .downcast_ref::<text_input::State<Renderer::Paragraph>>();
-            text_input_state.is_focused()
-        };
+        let is_focused = menu.input.is_focused();
 
         let mut focus_closed = false;
         if started_focused != is_focused {
@@ -797,18 +783,48 @@ where
         {
             shell.publish(on_close.clone());
         }
+
+        // Status and input-method handling, mirroring `text_input`/`combo_box`:
+        // the editor is no longer a child widget, so nothing else does this.
+        let status = if menu.input.is_focused() {
+            text_input::Status::Focused {
+                is_hovered: cursor.is_over(layout.bounds()),
+            }
+        } else if cursor.is_over(layout.bounds()) {
+            text_input::Status::Hovered
+        } else {
+            text_input::Status::Active
+        };
+
+        if let Event::Window(window::Event::RedrawRequested(_now)) = event {
+            self.last_status = Some(status);
+
+            shell.request_input_method(
+                &menu
+                    .input
+                    .input_method(layout.bounds().shrink(self.padding).position()),
+            );
+        } else if self
+            .last_status
+            .is_some_and(|last_status| status != last_status)
+        {
+            shell.request_redraw();
+        }
     }
 
     fn mouse_interaction(
         &self,
-        tree: &widget::Tree,
-        layout: Layout<'_>,
+        _tree: &widget::Tree,
+        layout: Layout,
         cursor: mouse::Cursor,
-        viewport: &Rectangle,
-        renderer: &Renderer,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.text_input
-            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+        if cursor.is_over(layout.bounds()) {
+            mouse::Interaction::Text
+        } else {
+            mouse::Interaction::default()
+        }
     }
 
     fn draw(
@@ -817,56 +833,72 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         _style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
+        layout: Layout,
+        _cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.text_input.draw(
-            &tree.children[0],
-            renderer,
+        let menu = tree.state.downcast_ref::<Menu<T, Renderer>>();
+        let bounds = layout.bounds();
+        let style = text_input::Catalog::style(
             theme,
-            layout,
-            cursor,
-            None,
-            viewport,
+            &self.input_class,
+            self.last_status.unwrap_or(text_input::Status::Active),
+        );
+
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds,
+                border: style.border,
+                ..renderer::Quad::default()
+            },
+            style.background,
+        );
+
+        menu.input.draw(
+            renderer,
+            bounds,
+            *viewport,
+            input::Style {
+                value: style.value,
+                selection: style.selection,
+                placeholder: style.placeholder,
+            },
         );
     }
 
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut widget::Tree,
-        layout: Layout<'_>,
-        _renderer: &Renderer,
-        viewport: &Rectangle,
+        layout: Layout,
+        renderer: &Renderer,
+        _viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<OverlayElement<'b, Message, Theme, Renderer>> {
-        let is_focused = {
-            let text_input_state = tree.children[0]
-                .state
-                .downcast_ref::<text_input::State<Renderer::Paragraph>>();
-            text_input_state.is_focused()
-        };
-
-        let is_open = tree.state.downcast_ref::<Menu<T>>().is_open;
+        window: Size,
+    ) -> Vec<iced_core::overlay::Element<'b, Message, Theme, Renderer>> {
+        let menu_state = tree.state.downcast_mut::<Menu<T, Renderer>>();
+        let is_focused = menu_state.input.is_focused();
+        let is_open = menu_state.is_open;
 
         if is_focused && is_open {
             let Menu {
+                input,
                 menu,
                 filtered_options,
                 hovered_option,
                 is_open: menu_open,
                 closed_by_click,
                 ..
-            } = tree.state.downcast_mut::<Menu<T>>();
+            } = tree.state.downcast_mut::<Menu<T, Renderer>>();
 
             self.state.sync_filtered_options(filtered_options);
 
             if filtered_options.options.is_empty() {
-                None
+                Vec::new()
             } else {
                 let bounds = layout.bounds();
+                let position = layout.position() + translation;
 
-                let to_value = &self.to_value;
+                let to_string: &dyn Fn(&T) -> String = &self.to_value;
                 let state = self.state;
                 let on_submit = &self.on_submit;
                 let on_option_selected_cb = self.on_option_selected.as_deref();
@@ -875,14 +907,16 @@ where
                     menu,
                     &filtered_options.options,
                     hovered_option,
+                    to_string,
                     // A click emits the selection message here rather than
                     // deferring to `new_selection`: the overlay captures the
                     // click, so the base `update` does not run in this event
                     // pass, and a deferred message would lag one frame — making
                     // `on_submit` observe a stale text value.
                     move |selection: T| {
-                        let value = to_value(&selection);
+                        let value = to_string(&selection);
                         state.set_value(value.clone());
+                        input.overwrite(&value);
                         *menu_open = false;
                         *closed_by_click = true;
                         match on_option_selected_cb {
@@ -896,8 +930,9 @@ where
                     &self.menu_class,
                 )
                 .width(bounds.width)
+                .height(self.menu_height)
                 .padding(self.padding)
-                .text_shaping(self.text_shaping);
+                .shaping(self.text_shaping);
 
                 if let Some(font) = self.font {
                     menu_widget = menu_widget.font(font);
@@ -906,16 +941,26 @@ where
                     menu_widget = menu_widget.text_size(size);
                 }
 
-                Some(menu_widget.overlay(
-                    layout.position() + translation,
-                    *viewport,
-                    bounds.height,
-                    self.menu_height,
-                ))
+                vec![menu_widget.overlay(renderer, position, window, bounds.height)]
             }
         } else {
-            None
+            Vec::new()
         }
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut widget::Tree,
+        layout: Layout,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
+        operation: &mut dyn widget::Operation,
+    ) {
+        let menu = tree.state.downcast_mut::<Menu<T, Renderer>>();
+        let bounds = layout.bounds();
+
+        operation.focusable(None, bounds, &mut menu.input);
+        operation.text_input(None, bounds, &mut menu.input);
     }
 }
 
@@ -938,10 +983,10 @@ where
     T: Display + Clone + 'static,
     Message: Clone + 'a,
     Theme: Catalog + 'a,
-    Renderer: text::Renderer + 'a,
+    Renderer: text::Renderer + 'static,
 {
     fn from(auto_complete: AutoComplete<'a, T, Message, Theme, Renderer>) -> Self {
-        Self::new(auto_complete)
+        Widget::_boxed(auto_complete)
     }
 }
 

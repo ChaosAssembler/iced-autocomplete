@@ -3,7 +3,7 @@
 //! Run with: `cargo run --example basic`
 
 use iced::widget::{column, text};
-use iced::{Element, Length, Task, Theme};
+use iced::{Length, Task, Theme, Widget};
 use iced_autocomplete::{Filter, State, auto_complete};
 
 fn main() -> iced::Result {
@@ -71,7 +71,7 @@ impl Demo {
         Task::none()
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self) -> impl Widget<Message> {
         column![
             text("Autocomplete demo").size(24),
             text(&self.last_event).size(14),
@@ -87,7 +87,6 @@ impl Demo {
         ]
         .spacing(16)
         .padding(24)
-        .into()
     }
 
     fn theme(&self) -> Theme {
