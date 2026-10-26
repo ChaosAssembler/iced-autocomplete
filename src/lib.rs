@@ -38,6 +38,33 @@
 //! Debouncing and out-of-order responses are also the application's job, since
 //! only it can see the requests. The `remote` example shows both.
 //!
+//! # Disabled state
+//!
+//! Like `text_input`, the widget is disabled when no input callback is set.
+//! Pass `None` as `on_input`, or use [`AutoComplete::on_input_maybe`] to toggle
+//! it while rebuilding the view. A disabled widget suppresses typing,
+//! submission, and option selection, closes the menu, and renders with
+//! [`iced_widget::text_input::Status::Disabled`].
+//!
+//! ```no_run
+//! # use iced_autocomplete::{State, auto_complete};
+//! # #[derive(Clone)]
+//! # enum Message {
+//! #     Changed(String),
+//! #     Submitted(String),
+//! # }
+//! # fn view(state: &State<String>, is_editable: bool) -> iced::Element<'_, Message> {
+//! auto_complete(
+//!     state,
+//!     "Type to search…",
+//!     is_editable.then_some(Message::Changed),
+//!     Message::Submitted,
+//!     None::<fn(String) -> Message>,
+//! )
+//! .into()
+//! # }
+//! ```
+//!
 //! # Example
 //!
 //! ```no_run
@@ -54,7 +81,7 @@
 //!     auto_complete(
 //!         state,
 //!         "Type to search…",
-//!         |text| Message::Changed(text),
+//!         Some(|text| Message::Changed(text)),
 //!         |text| Message::Submitted(text),
 //!         Some(|option| Message::Selected(option)),
 //!     )

@@ -78,7 +78,7 @@ impl Demo {
             auto_complete(
                 &self.state,
                 "Type to filter languages…",
-                Message::Changed,
+                Some(Message::Changed),
                 Message::Submitted,
                 Some(|option: &'static str| Message::Selected(option.to_string())),
             )

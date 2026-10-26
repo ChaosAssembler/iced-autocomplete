@@ -34,7 +34,10 @@ use std::time::Instant;
 ///   held by the caller.
 /// - `placeholder`: the placeholder shown when the text is empty.
 /// - `on_input`: called on every text change. Handle it in your application's
-///   `update`; the widget performs no I/O and no debouncing.
+///   `update`; the widget performs no I/O and no debouncing. Pass `None` to
+///   create a disabled widget, mirroring [`iced_widget::text_input::TextInput`].
+///   A bare `None` needs a type annotation, e.g.
+///   `None::<fn(String) -> Message>`.
 /// - `on_submit`: called when the current text is submitted (either free text
 ///   or the value filled in after selecting an option).
 /// - `on_option_selected`: called when a specific option is selected (optional).
@@ -46,7 +49,7 @@ use std::time::Instant;
 pub fn auto_complete<'a, T, Message, Theme, Renderer>(
     state: &'a State<T>,
     placeholder: &'a str,
-    on_input: impl Fn(String) -> Message + 'a,
+    on_input: Option<impl Fn(String) -> Message + 'a>,
     on_submit: impl Fn(String) -> Message + 'a,
     on_option_selected: Option<impl Fn(T) -> Message + 'a>,
 ) -> AutoComplete<'a, T, Message, Theme, Renderer>
@@ -64,7 +67,7 @@ where
         size: None,
         line_height: None,
         width: Length::Fill,
-        on_input: Box::new(on_input),
+        on_input: on_input.map(|on_input| Box::new(on_input) as _),
         on_submit: Box::new(on_submit),
         on_option_selected: on_option_selected
             .map(|f| Box::new(f) as Box<dyn Fn(T) -> Message + 'a>),
@@ -93,7 +96,7 @@ where
     size: Option<f32>,
     line_height: Option<text::LineHeight>,
     width: Length,
-    on_input: Box<dyn Fn(String) -> Message + 'a>,
+    on_input: Option<Box<dyn Fn(String) -> Message + 'a>>,
     on_submit: Box<dyn Fn(String) -> Message + 'a>,
     on_option_selected: Option<Box<dyn Fn(T) -> Message + 'a>>,
     to_value: Box<dyn Fn(&T) -> String + 'a>,
@@ -149,7 +152,18 @@ where
 
     /// Sets the message produced on every text change.
     pub fn on_input(mut self, on_input: impl Fn(String) -> Message + 'a) -> Self {
-        self.on_input = Box::new(on_input);
+        self.on_input = Some(Box::new(on_input));
+        self
+    }
+
+    /// Sets the message produced on every text change, if any.
+    ///
+    /// If `None`, the [`AutoComplete`] is disabled: it ignores all input
+    /// events, does not submit or select options, does not open its menu, and
+    /// is rendered with [`text_input::Status::Disabled`]. This mirrors the
+    /// disabled behavior of [`iced_widget::text_input::TextInput`].
+    pub fn on_input_maybe(mut self, on_input: Option<impl Fn(String) -> Message + 'a>) -> Self {
+        self.on_input = on_input.map(|on_input| Box::new(on_input) as _);
         self
     }
 
@@ -611,168 +625,196 @@ where
         _viewport: &Rectangle,
     ) {
         let menu = tree.state.downcast_mut::<Menu<T, Renderer>>();
-
-        let started_focused = menu.input.is_focused();
-
-        // Let the editor handle input events first (typing, cursor, focus).
-        let edit = menu.input.update(
-            event,
-            layout.bounds(),
-            cursor,
-            shell,
-            editor::Binding::from_key_press,
-        );
-
-        // React to text changes.
-        if edit.is_some() {
-            let new_value = menu.input.value();
-
-            shell.publish((self.on_input)(new_value.clone()));
-
-            self.state.with_inner_mut(|state| {
-                menu.hovered_option = Some(0);
-                menu.is_open = true;
-                state.value = new_value;
-                let filtered = apply_filter(&state.filter, &self.state.options, &state.value);
-                state.filtered_options.update(filtered);
-            });
-            shell.invalidate_layout();
-            shell.request_redraw();
-        }
-
-        let is_focused = menu.input.is_focused();
+        let is_disabled = self.on_input.is_none();
 
         // Set when `Escape` closes the menu. Collected rather than published
         // inline so every close is reported from one place, exactly once.
         let mut escaped = false;
-
-        if is_focused {
-            self.state.with_inner(|state| {
-                if let Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(named_key),
-                    modifiers,
-                    ..
-                }) = event
-                {
-                    match named_key {
-                        // Enter: accept the hovered option if any, otherwise
-                        // submit the free text.
-                        key::Named::Enter => {
-                            if menu.is_open
-                                && let Some(index) = menu.hovered_option
-                                && let Some(option) = state.filtered_options.options.get(index)
-                            {
-                                menu.new_selection = Some(option.clone());
-                            } else {
-                                shell.publish((self.on_submit)(self.state.value()));
-                            }
-                            shell.capture_event();
-                            shell.request_redraw();
-                        }
-                        // Tab: accept the hovered option (default); without a
-                        // hover, let native focus navigation proceed.
-                        key::Named::Tab if !modifiers.shift() => {
-                            if menu.is_open
-                                && let Some(index) = menu.hovered_option
-                                && let Some(option) = state.filtered_options.options.get(index)
-                            {
-                                menu.new_selection = Some(option.clone());
-                                shell.capture_event();
-                                shell.request_redraw();
-                            }
-                        }
-                        // Arrow up / Shift+Tab: move up in the options.
-                        key::Named::ArrowUp | key::Named::Tab if modifiers.shift() => {
-                            if menu.is_open {
-                                if let Some(index) = &mut menu.hovered_option {
-                                    if *index == 0 {
-                                        *index =
-                                            state.filtered_options.options.len().saturating_sub(1);
-                                    } else {
-                                        *index = index.saturating_sub(1);
-                                    }
-                                } else {
-                                    menu.hovered_option = Some(0);
-                                }
-                                shell.capture_event();
-                                shell.request_redraw();
-                            }
-                        }
-                        // Arrow down: move down in the options.
-                        key::Named::ArrowDown => {
-                            if menu.is_open {
-                                if let Some(index) = &mut menu.hovered_option {
-                                    if *index
-                                        >= state.filtered_options.options.len().saturating_sub(1)
-                                    {
-                                        *index = 0;
-                                    } else {
-                                        *index = index.saturating_add(1).min(
-                                            state.filtered_options.options.len().saturating_sub(1),
-                                        );
-                                    }
-                                } else {
-                                    menu.hovered_option = Some(0);
-                                }
-                                shell.capture_event();
-                                shell.request_redraw();
-                            }
-                        }
-                        // Escape: close the menu, keep the current text.
-                        key::Named::Escape => {
-                            escaped = menu.is_open;
-                            menu.is_open = false;
-                            shell.capture_event();
-                            shell.request_redraw();
-                        }
-                        _ => {}
-                    }
-                }
-            });
-        }
-
-        // Handle options selected via keyboard (Enter/Tab): options picked by
-        // mouse clicks are already emitted directly in the overlay's
-        // `on_selected` closure; here we only consume `new_selection` written
-        // by the keyboard path.
         let mut selection_closed = false;
-        if let Some(selection) = menu.new_selection.take() {
-            let value = self.state.value();
-            // After selecting an option, keep the input filled and focused.
-            if let Some(on_option_selected) = &self.on_option_selected {
-                shell.publish(on_option_selected(selection));
-            }
-            shell.publish((self.on_submit)(value));
-            menu.is_open = false;
-            menu.hovered_option = Some(0);
-            selection_closed = true;
-            shell.request_redraw();
-        }
-
-        let is_focused = menu.input.is_focused();
-
         let mut focus_closed = false;
-        if started_focused != is_focused {
-            // Focus changed; force a widget tree rebuild to trigger a new view.
-            shell.invalidate_widgets();
+        let mut click_closed = false;
+
+        if let Some(on_input) = &self.on_input {
+            let started_focused = menu.input.is_focused();
+
+            // Let the editor handle input events first (typing, cursor, focus).
+            let edit = menu.input.update(
+                event,
+                layout.bounds(),
+                cursor,
+                shell,
+                editor::Binding::from_key_press,
+            );
+
+            // React to text changes.
+            if edit.is_some() {
+                let new_value = menu.input.value();
+
+                shell.publish(on_input(new_value.clone()));
+
+                self.state.with_inner_mut(|state| {
+                    menu.hovered_option = Some(0);
+                    menu.is_open = true;
+                    state.value = new_value;
+                    let filtered = apply_filter(&state.filter, &self.state.options, &state.value);
+                    state.filtered_options.update(filtered);
+                });
+                shell.invalidate_layout();
+                shell.request_redraw();
+            }
+
+            let is_focused = menu.input.is_focused();
 
             if is_focused {
-                // Opening the menu on focus matches combo_box behavior.
-                menu.is_open = true;
-                menu.hovered_option = Some(0);
-                if let Some(on_open) = &self.on_open {
-                    shell.publish(on_open.clone());
+                self.state.with_inner(|state| {
+                    if let Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(named_key),
+                        modifiers,
+                        ..
+                    }) = event
+                    {
+                        match named_key {
+                            // Enter: accept the hovered option if any, otherwise
+                            // submit the free text.
+                            key::Named::Enter => {
+                                if menu.is_open
+                                    && let Some(index) = menu.hovered_option
+                                    && let Some(option) = state.filtered_options.options.get(index)
+                                {
+                                    menu.new_selection = Some(option.clone());
+                                } else {
+                                    shell.publish((self.on_submit)(self.state.value()));
+                                }
+                                shell.capture_event();
+                                shell.request_redraw();
+                            }
+                            // Tab: accept the hovered option (default); without a
+                            // hover, let native focus navigation proceed.
+                            key::Named::Tab if !modifiers.shift() => {
+                                if menu.is_open
+                                    && let Some(index) = menu.hovered_option
+                                    && let Some(option) = state.filtered_options.options.get(index)
+                                {
+                                    menu.new_selection = Some(option.clone());
+                                    shell.capture_event();
+                                    shell.request_redraw();
+                                }
+                            }
+                            // Arrow up / Shift+Tab: move up in the options.
+                            key::Named::ArrowUp | key::Named::Tab if modifiers.shift() => {
+                                if menu.is_open {
+                                    if let Some(index) = &mut menu.hovered_option {
+                                        if *index == 0 {
+                                            *index = state
+                                                .filtered_options
+                                                .options
+                                                .len()
+                                                .saturating_sub(1);
+                                        } else {
+                                            *index = index.saturating_sub(1);
+                                        }
+                                    } else {
+                                        menu.hovered_option = Some(0);
+                                    }
+                                    shell.capture_event();
+                                    shell.request_redraw();
+                                }
+                            }
+                            // Arrow down: move down in the options.
+                            key::Named::ArrowDown => {
+                                if menu.is_open {
+                                    if let Some(index) = &mut menu.hovered_option {
+                                        if *index
+                                            >= state
+                                                .filtered_options
+                                                .options
+                                                .len()
+                                                .saturating_sub(1)
+                                        {
+                                            *index = 0;
+                                        } else {
+                                            *index = index.saturating_add(1).min(
+                                                state
+                                                    .filtered_options
+                                                    .options
+                                                    .len()
+                                                    .saturating_sub(1),
+                                            );
+                                        }
+                                    } else {
+                                        menu.hovered_option = Some(0);
+                                    }
+                                    shell.capture_event();
+                                    shell.request_redraw();
+                                }
+                            }
+                            // Escape: close the menu, keep the current text.
+                            key::Named::Escape => {
+                                escaped = menu.is_open;
+                                menu.is_open = false;
+                                shell.capture_event();
+                                shell.request_redraw();
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+
+            // Handle options selected via keyboard (Enter/Tab): options picked
+            // by mouse clicks are already emitted directly in the overlay's
+            // `on_selected` closure; here we only consume `new_selection`
+            // written by the keyboard path.
+            if let Some(selection) = menu.new_selection.take() {
+                let value = self.state.value();
+                // After selecting an option, keep the input filled and focused.
+                if let Some(on_option_selected) = &self.on_option_selected {
+                    shell.publish(on_option_selected(selection));
                 }
-            } else {
-                // Only report a close if the menu was actually open.
-                focus_closed = menu.is_open;
+                shell.publish((self.on_submit)(value));
                 menu.is_open = false;
+                menu.hovered_option = Some(0);
+                selection_closed = true;
+                shell.request_redraw();
+            }
+
+            let is_focused = menu.input.is_focused();
+
+            if started_focused != is_focused {
+                // Focus changed; force a widget tree rebuild to trigger a new view.
+                shell.invalidate_widgets();
+
+                if is_focused {
+                    // Opening the menu on focus matches combo_box behavior.
+                    menu.is_open = true;
+                    menu.hovered_option = Some(0);
+                    if let Some(on_open) = &self.on_open {
+                        shell.publish(on_open.clone());
+                    }
+                } else {
+                    // Only report a close if the menu was actually open.
+                    focus_closed = menu.is_open;
+                    menu.is_open = false;
+                }
+            }
+
+            // A click closes the menu inside the overlay, which cannot publish
+            // `on_close` itself; it records the event instead.
+            click_closed = std::mem::take(&mut menu.closed_by_click);
+        } else {
+            // Disabled: leave the value visible, but drop any interaction state
+            // so re-enabling starts from a clean slate.
+            let was_focused = menu.input.is_focused();
+
+            focus_closed = std::mem::take(&mut menu.is_open);
+            menu.input.unfocus();
+            menu.new_selection = None;
+            menu.closed_by_click = false;
+
+            if was_focused || focus_closed {
+                shell.request_redraw();
             }
         }
-
-        // A click closes the menu inside the overlay, which cannot publish
-        // `on_close` itself; it records the event instead.
-        let click_closed = std::mem::take(&mut menu.closed_by_click);
 
         // Emit `on_close` at most once per pass. The reasons can overlap — a
         // click both selects and closes, and losing focus closes the menu too —
@@ -786,7 +828,9 @@ where
 
         // Status and input-method handling, mirroring `text_input`/`combo_box`:
         // the editor is no longer a child widget, so nothing else does this.
-        let status = if menu.input.is_focused() {
+        let status = if is_disabled {
+            text_input::Status::Disabled
+        } else if menu.input.is_focused() {
             text_input::Status::Focused {
                 is_hovered: cursor.is_over(layout.bounds()),
             }
@@ -821,7 +865,11 @@ where
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         if cursor.is_over(layout.bounds()) {
-            mouse::Interaction::Text
+            if self.on_input.is_none() {
+                mouse::Interaction::Idle
+            } else {
+                mouse::Interaction::Text
+            }
         } else {
             mouse::Interaction::default()
         }
@@ -839,11 +887,14 @@ where
     ) {
         let menu = tree.state.downcast_ref::<Menu<T, Renderer>>();
         let bounds = layout.bounds();
-        let style = text_input::Catalog::style(
-            theme,
-            &self.input_class,
-            self.last_status.unwrap_or(text_input::Status::Active),
-        );
+        let status = self.last_status.unwrap_or_else(|| {
+            if self.on_input.is_some() {
+                text_input::Status::Active
+            } else {
+                text_input::Status::Disabled
+            }
+        });
+        let style = text_input::Catalog::style(theme, &self.input_class, status);
 
         renderer.fill_quad(
             renderer::Quad {
@@ -879,7 +930,7 @@ where
         let is_focused = menu_state.input.is_focused();
         let is_open = menu_state.is_open;
 
-        if is_focused && is_open {
+        if self.on_input.is_some() && is_focused && is_open {
             let Menu {
                 input,
                 menu,
@@ -1166,5 +1217,37 @@ mod tests {
         let state: State<&str> = State::default();
         assert!(state.options().is_empty());
         assert_eq!(state.value(), "");
+    }
+
+    #[test]
+    fn none_on_input_disables_the_widget() {
+        let state = local_state(names());
+        let mut disabled: AutoComplete<'_, &'static str, (), Theme, ()> = auto_complete(
+            &state,
+            "Search",
+            None::<fn(String) -> ()>,
+            |_| (),
+            None::<fn(&'static str) -> ()>,
+        );
+
+        assert!(disabled.on_input.is_none());
+
+        let mut tree = widget::Tree::new(&disabled);
+        disabled.layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::new(160.0, 40.0), Size::new(160.0, 40.0)),
+        );
+
+        let cursor = mouse::Cursor::Available(iced_core::Point::new(10.0, 10.0));
+        let interaction = disabled.mouse_interaction(
+            &tree,
+            Layout::new(tree.size),
+            cursor,
+            &Rectangle::default(),
+            &(),
+        );
+
+        assert_eq!(interaction, mouse::Interaction::Idle);
     }
 }

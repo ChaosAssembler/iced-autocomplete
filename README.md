@@ -19,6 +19,8 @@ including asynchronous remote search.
 - Free-text submission: values outside the option list are allowed.
 - Keyboard support: `↑`/`↓` (or `Shift+Tab`/`Tab`) to move, `Enter`/`Tab` to
   accept, `Escape` to dismiss.
+- **Disable-able**: pass `None` to `on_input_maybe` to suppress input,
+  submission, selection, and the menu.
 - **Explicit filtering**: you state the matching rule; the widget ships no
   default. See [Filtering](#filtering).
 - **Async-friendly**: hand a remote result set to `State::set_options` and it
@@ -64,6 +66,23 @@ The widget performs no I/O. In iced, widgets publish messages and only your
 Debouncing and out-of-order responses also belong to the application, since
 only it can see the requests. The `remote` example demonstrates both.
 
+## Disabled state
+
+Like `text_input`, the widget is disabled when no input callback is set. Pass
+`None` as `on_input`, or use `on_input_maybe` to toggle it. `None` suppresses
+typing, submission, and option selection, closes the menu, and uses the theme's
+disabled `text_input` style.
+
+```rust
+auto_complete(
+    state,
+    "Type to search…",
+    is_editable.then_some(Message::Changed),
+    Message::Submitted,
+    None::<fn(String) -> Message>,
+);
+```
+
 ## Usage
 
 Add to your `Cargo.toml`:
@@ -97,7 +116,7 @@ fn view(state: &State<String>) -> iced::Element<'_, Message> {
     auto_complete(
         state,
         "Type to search…",
-        |text| Message::Changed(text),
+        Some(|text| Message::Changed(text)),
         |text| Message::Submitted(text),
         Some(|option| Message::Selected(option)),
     )

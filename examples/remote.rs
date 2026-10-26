@@ -156,14 +156,14 @@ impl Demo {
                 "Search a remote catalog…",
                 // `on_input` only sees the text; the tag is attached here so the
                 // response can be matched back to this keystroke.
-                move |text| {
+                Some(move |text| {
                     let request = self.next_request.get() + 1;
                     self.next_request.set(request);
                     Message::Input {
                         query: text,
                         request,
                     }
-                },
+                }),
                 Message::Submitted,
                 Some(Message::Selected),
             )
